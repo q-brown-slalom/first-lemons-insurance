@@ -1,0 +1,113 @@
+{
+  "spec_version": "2.0",
+  "generated_by": "SpecAgent — First Lemons Insurance",
+  "feature": "Payment History for Policyholders",
+  "request_id": "REQ-001",
+  "story_id": "US-001",
+  "generated_at": "2026-05-29T00:00:00Z",
+  "status": "ready_for_development",
+
+  "story": {
+    "id": "US-001",
+    "role": "All authenticated users",
+    "title": "View Payment History",
+    "narrative": "As an authenticated policyholder, I want to review my payment history so that I can confirm what I paid, when it was processed, and which payment method was used without contacting support.",
+    "priority": "Medium",
+    "acceptance_criteria": [
+      "GET /api/payments/history returns only payment records belonging to the authenticated user identified from the Authentication object.",
+      "The Payment History page is accessible from the Bills navigation section for authenticated users.",
+      "The page displays payment records in descending processedDate order.",
+      "The page displays a minimum of 12 months of payment history and supports retrieval of all available historical records.",
+      "Each payment row displays processedDate, transactionReference, description, paymentMethodReference, amount, and status.",
+      "paymentMethodReference displays only a masked identifier in the format '•••• 4242' or equivalent last-four format.",
+      "The API never returns full PAN, CVV, PIN, magnetic stripe data, or any Sensitive Authentication Data.",
+      "Users attempting to access payment records that do not belong to them receive HTTP 403 Forbidden and no payment data is returned.",
+      "When no payment records exist, the UI displays the exact copy string 'No payment history available.'",
+      "The transaction table supports pagination with a default page size of 25 records.",
+      "Supported payment statuses are PROCESSED, PENDING, FAILED, REFUNDED, and REVERSED.",
+      "Autopay transactions, one-time payments, refunds, reversals, and billing adjustments are included in payment history.",
+      "Every successful payment-history retrieval generates an audit log entry containing userId, eventType='PAYMENT_HISTORY_VIEW', timestamp, and outcome='SUCCESS'.",
+      "Every failed or unauthorized payment-history retrieval generates an audit log entry containing userId when available, eventType='PAYMENT_HISTORY_VIEW', timestamp, and outcome='FAILURE'.",
+      "Unexpected server errors return HTTP 500 with the exact message 'Unable to retrieve payment history.' and do not expose payment data or internal system details."
+    ]
+  },
+
+  "resolved_decisions": {
+    "history_retention_display": "Display all available historical payment records with a minimum requirement of 12 months available.",
+    "pagination": "Enabled with default page size of 25 records.",
+    "searching": "Not included in scope.",
+    "filtering": "Not included in scope.",
+    "export": "Out of scope.",
+    "receipt_detail": "Out of scope.",
+    "payment_statuses": "PROCESSED, PENDING, FAILED, REFUNDED, REVERSED.",
+    "included_transaction_types": "Autopay, one-time payments, refunds, reversals, and billing adjustments.",
+    "empty_state": "Display 'No payment history available.'",
+    "shared_access": "Users may view only their own payment history."
+  },
+
+  "mockups": {
+    "directory": "new-feature-demo/mockups/",
+    "design_system": "new-feature-demo/mockups/DESIGN.md",
+    "screens": [
+      {
+        "file": "screen.png",
+        "description": "Primary payment history page — loaded state with transaction table."
+      },
+      {
+        "file": "admin-payments.png",
+        "description": "Admin role view of the payments area."
+      },
+      {
+        "file": "receipt-detail.png",
+        "description": "Receipt detail view — explicitly out of scope for this story, included for design context only."
+      }
+    ]
+  },
+
+  "compliance_requirements_applied": [
+    {
+      "requirement": "PCI-DSS 3.3.1",
+      "how_addressed": "No Sensitive Authentication Data is stored, returned, logged, or displayed by the feature."
+    },
+    {
+      "requirement": "PCI-DSS 3.4.1",
+      "how_addressed": "Payment methods are displayed only as masked references using last-four format."
+    },
+    {
+      "requirement": "PCI-DSS 7.2.1",
+      "how_addressed": "Users can retrieve only their own payment records based on authenticated identity."
+    },
+    {
+      "requirement": "PCI-DSS 7.3.1",
+      "how_addressed": "Endpoint access requires explicit authorization configuration and denies access by default."
+    },
+    {
+      "requirement": "PCI-DSS 10.2.1",
+      "how_addressed": "Payment-history access events are logged for monitoring purposes."
+    },
+    {
+      "requirement": "PCI-DSS 10.2.1.1",
+      "how_addressed": "Audit records capture user identity, event type, timestamp, and success or failure outcome."
+    },
+    {
+      "requirement": "PCI-DSS 10.3.1",
+      "how_addressed": "Audit logs remain protected and accessible only to authorized personnel."
+    },
+    {
+      "requirement": "PCI-DSS 6.2.4",
+      "how_addressed": "User-scoped queries, parameterized data access, and API-layer authorization enforcement are required."
+    }
+  ],
+
+  "explicitly_out_of_scope": [
+    "CSV export",
+    "PDF export",
+    "Receipt detail page",
+    "Invoice generation",
+    "Tax document requests",
+    "Billing dispute workflow",
+    "Administrative payment-history management",
+    "Search functionality",
+    "Advanced filtering"
+  ]
+}
