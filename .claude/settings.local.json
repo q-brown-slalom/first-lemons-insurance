@@ -4,7 +4,8 @@
       "Bash(Get-ChildItem *)",
       "Bash(gradle *)",
       "Bash(where gradle *)",
-      "Bash(xargs grep -l \"public static void main\")"
+      "Bash(xargs grep -l \"public static void main\")",
+      "Write(*)"
     ]
   }
 }

@@ -1,0 +1,225 @@
+{
+  "generated_by": "dev-handoff-agent",
+  "generated_at": "2026-05-29T00:00:00Z",
+  "based_on_spec": "new-feature-demo/new-feature-data.json",
+
+  "feature": {
+    "name": "Payment History for Policyholders",
+    "story_id": "US-001",
+    "summary": "Authenticated policyholders can view their own paginated payment transaction history — sorted by processed date descending, with masked payment method references and all five statuses supported — via a new GET /api/payments/history endpoint and a new Payment History page accessible from the Bills section of the sidebar."
+  },
+
+  "corrected_implementation_touchpoints": {
+    "note": "The SpecAgent invented paths under a package com.firstlemons.payments that does not exist. All backend code lives in com.firstlemons.portal. All frontend pages use .jsx, not .tsx. Every path below is derived from the real file tree.",
+    "backend_base": "backend/src/main/java/com/firstlemons/portal/",
+    "frontend_base": "frontend/src/",
+
+    "files": [
+      {
+        "path": "backend/src/main/java/com/firstlemons/portal/model/PaymentTransaction.java",
+        "status": "net-new",
+        "reason": "New JPA entity for the payment_transaction table. No existing payment or transaction model exists in the model package. Must follow the exact @Entity / @Table / @Data / @NoArgsConstructor / @AllArgsConstructor / Lombok pattern used in Bill.java. Required fields: id (Long, @Id @GeneratedValue), userId (Long, @Column(nullable=false)), processedDate (LocalDateTime), transactionReference (String), description (String), paymentMethodReference (String — store only the masked last-four value, e.g. '•••• 4242', never a full PAN), amount (BigDecimal), status (String — values: PROCESSED, PENDING, FAILED, REFUNDED, REVERSED)."
+      },
+      {
+        "path": "backend/src/main/java/com/firstlemons/portal/repository/PaymentTransactionRepository.java",
+        "status": "net-new",
+        "reason": "New Spring Data JPA repository. No repository for payment transactions exists. Must extend JpaRepository<PaymentTransaction, Long> and declare a Pageable-aware query method: Page<PaymentTransaction> findByUserIdOrderByProcessedDateDesc(Long userId, Pageable pageable)."
+      },
+      {
+        "path": "backend/src/main/java/com/firstlemons/portal/service/PaymentTransactionService.java",
+        "status": "net-new",
+        "reason": "New service class. Must follow the @Service / @RequiredArgsConstructor / Lombok pattern used in BillService.java. Responsible for querying PaymentTransactionRepository scoped strictly by userId and returning a Page<PaymentTransaction>."
+      },
+      {
+        "path": "backend/src/main/java/com/firstlemons/portal/controller/PaymentController.java",
+        "status": "net-new",
+        "reason": "New REST controller. Must follow the exact auth pattern in BillController.java: accept Authentication auth as a method parameter, call userService.getUserByUsername(auth.getName()) to resolve the User entity, then pass user.getId() to the service — the client never supplies a userId. Endpoint: GET /api/payments/history. Accepts pagination query params: page (default 0) and size (default 25). Package: com.firstlemons.portal.controller."
+      },
+      {
+        "path": "backend/src/main/java/com/firstlemons/portal/config/SecurityConfig.java",
+        "status": "existing file to modify",
+        "reason": "The current catch-all rule anyRequest().authenticated() already covers /api/payments/history, so no structural change is required for basic JWT enforcement. However, if a role restriction is added (e.g. blocking ADMIN from the policyholder view at the HTTP layer), this file must be updated. QE should verify the route is not accidentally covered by the permitAll block — it is not; the only permitAll entries are /api/auth/** and /h2-console/**."
+      },
+      {
+        "path": "backend/src/main/java/com/firstlemons/portal/config/DataInitializer.java",
+        "status": "existing file to modify",
+        "reason": "Must be extended with PaymentTransactionRepository injected as a private final field (matching the existing pattern for billRepository, claimRepository, etc.) and seed rows added in the run() method. See test_data_setup for exact requirements."
+      },
+      {
+        "path": "frontend/src/pages/PaymentHistory.jsx",
+        "status": "net-new",
+        "reason": "New page component. Extension must be .jsx — every existing page (Bills.jsx, Dashboard.jsx, Claims.jsx, etc.) uses .jsx, not .tsx. Must follow the Bills.jsx pattern: functional component, MUI Table/TableContainer/Paper, data fetched via api.get() using the shared Axios instance in frontend/src/services/api.js, which automatically attaches the Bearer token from localStorage key 'fl_token'. Empty-state copy must be exactly: 'No payment history available.' — this is a literal acceptance criterion."
+      },
+      {
+        "path": "frontend/src/App.jsx",
+        "status": "existing file to modify",
+        "reason": "New route must be added inside the ProtectedRoute/Layout block: <Route path=\"payment-history\" element={<PaymentHistory />} />, consistent with the existing route declarations for /bills, /claims, etc."
+      },
+      {
+        "path": "frontend/src/components/Sidebar.jsx",
+        "status": "existing file to modify",
+        "reason": "A new entry must be added to the navItems array for Payment History, pointing to /payment-history. Per the spec it should be accessible from the Bills navigation section, so it should appear adjacent to the Bills entry. The roles array should include at minimum EMPLOYEE and OWNER. Whether ADMIN sees it is an open product decision — see qe_notes."
+      }
+    ]
+  },
+
+  "test_data_setup": {
+    "seeded_users": [
+      {
+        "username": "alice",
+        "password": "password",
+        "role": "EMPLOYEE",
+        "full_name": "Alice Lemonhart",
+        "notes": "Primary policyholder test user. Seed alice with a full set of payment_transaction rows covering all five statuses and spanning at least 13 months (e.g. May 2025 back through April 2024) to satisfy the 12-month minimum display requirement."
+      },
+      {
+        "username": "bob",
+        "password": "password",
+        "role": "OWNER",
+        "full_name": "Bob Citruski",
+        "notes": "Second policyholder test user. Seed bob with at least one row per status to verify cross-user isolation — alice's payment records must never appear in bob's response and vice versa."
+      },
+      {
+        "username": "carol",
+        "password": "password",
+        "role": "ADMIN",
+        "full_name": "Carol Admins",
+        "notes": "ADMIN user. Seed zero payment_transaction rows for carol. This validates the empty-state ('No payment history available.') and confirms the feature does not conflate admin access with policyholder history. See qe_notes for the open product question about whether ADMIN receives 200 with empty content or 403."
+      }
+    ],
+
+    "payment_transaction_seed_requirements": {
+      "inject_into": "backend/src/main/java/com/firstlemons/portal/config/DataInitializer.java",
+      "inject_repository": "private final PaymentTransactionRepository paymentTransactionRepository — add as a field alongside billRepository, claimRepository, etc.; Lombok @RequiredArgsConstructor handles injection automatically",
+      "required_statuses_covered": ["PROCESSED", "PENDING", "FAILED", "REFUNDED", "REVERSED"],
+      "minimum_date_span": "13 calendar months to comfortably satisfy the 12-month minimum display requirement",
+      "minimum_rows_for_alice": 15,
+      "seed_guidance": [
+        "At least one row for each of the five statuses must exist for alice so all status chip variants render and can be verified.",
+        "Include at least one REFUNDED and one REVERSED row — these are explicitly in scope and less commonly tested.",
+        "Include rows with at least two different paymentMethodReference values (e.g. '•••• 4242' and '•••• 1111') to verify masked rendering.",
+        "Bob needs at least 5 rows (one per status) to verify cross-user isolation.",
+        "Carol needs zero rows. Do not seed any payment_transaction rows for carol.",
+        "Spread processedDate values across months — do not cluster all rows in a single month, as that would not exercise the 12-month display check.",
+        "amount should be BigDecimal, e.g. new BigDecimal(\"145.00\"), consistent with the existing bill seed data style.",
+        "transactionReference should be a human-readable string (e.g. 'TXN-2024-0401-001') as it appears directly in the UI table."
+      ]
+    },
+
+    "no_history_test_case": {
+      "user": "carol (ADMIN, zero rows seeded)",
+      "expected_ui": "Page renders with empty state copy: 'No payment history available.'",
+      "expected_api": "HTTP 200 with a Page response body where content is an empty array and totalElements is 0 (unless a role restriction is added — see qe_notes)"
+    }
+  },
+
+  "api_verification": {
+    "base_url": "http://localhost:8080/api",
+    "endpoint": "GET /api/payments/history",
+
+    "jwt_enforcement": {
+      "how_it_works": "SecurityConfig.java configures anyRequest().authenticated() — every request to /api/payments/history must carry a valid JWT. JwtAuthFilter (OncePerRequestFilter) reads the Authorization header, extracts the Bearer token, calls JwtService.isTokenValid(), and populates the Spring SecurityContext. The controller then calls auth.getName() to get the username string, resolves the User entity via userService.getUserByUsername(), and uses user.getId() as the userId scope. The client never supplies a userId.",
+      "how_to_obtain_token": "POST /api/auth/login with body {\"username\": \"alice\", \"password\": \"password\"}. The response contains a 'token' field. Tokens are 24-hour HMAC-SHA JWTs.",
+      "request_header": "Authorization: Bearer <token>",
+      "token_storage_note": "The frontend stores the token in localStorage under the key 'fl_token'. The Axios instance in frontend/src/services/api.js attaches it automatically to every outbound request."
+    },
+
+    "userId_scoping": {
+      "pattern": "Identical to BillController.java. The controller resolves userId server-side from the Authentication object — userService.getUserByUsername(auth.getName()) then user.getId(). The client never sends a userId in the request URL or body. This is the correct PCI-DSS 7.2.1 pattern.",
+      "cross_user_isolation_test": "Obtain separate tokens for alice and bob via /api/auth/login. Issue GET /api/payments/history with alice's token and confirm the response contains only alice's transactionReferences. Repeat with bob's token and confirm only bob's records are returned. There must be zero overlap."
+    },
+
+    "pagination": {
+      "default_page_size": 25,
+      "default_page_number": 0,
+      "query_params": {
+        "page": "integer, zero-indexed, default 0",
+        "size": "integer, default 25"
+      },
+      "example_requests": [
+        "GET /api/payments/history",
+        "GET /api/payments/history?page=0&size=25",
+        "GET /api/payments/history?page=1&size=10"
+      ],
+      "expected_response_shape": "Spring Page<PaymentTransaction> object with keys: content (array of transaction objects), totalElements (long), totalPages (int), size (int), number (int)"
+    },
+
+    "response_status_matrix": [
+      {
+        "scenario": "Valid JWT, user has payment records",
+        "http_status": 200,
+        "body": "Page object with content array. Each transaction object includes: processedDate, transactionReference, description, paymentMethodReference (masked, e.g. '•••• 4242'), amount, status. Must NOT include full card number, CVV, or any Sensitive Authentication Data (PCI-DSS 3.3.1)."
+      },
+      {
+        "scenario": "Valid JWT, user has no payment records (carol)",
+        "http_status": 200,
+        "body": "Page object with empty content array and totalElements: 0"
+      },
+      {
+        "scenario": "No Authorization header supplied",
+        "http_status": 401,
+        "body": "Spring Security default 401 response. JwtAuthFilter passes the request through without populating the SecurityContext when the header is absent; Spring Security then rejects it via the anyRequest().authenticated() rule. The frontend api.js interceptor detects 401, clears localStorage, and redirects to /login."
+      },
+      {
+        "scenario": "Expired or malformed JWT in Authorization header",
+        "http_status": 401,
+        "body": "Spring Security default 401. JwtService.isTokenValid() returns false; the filter does not populate the SecurityContext."
+      },
+      {
+        "scenario": "Authenticated user attempts to access another user's records",
+        "http_status": 403,
+        "body": "HTTP 403 Forbidden. No payment data returned.",
+        "notes": "The server-side userId scoping means a standard GET /api/payments/history request cannot reach another user's data. 403 enforcement becomes relevant if any path-variable variant is added (e.g. /api/payments/history/{userId}). If that variant is implemented, the service layer must verify that the requested userId matches the authenticated user's id — analogous to the ownership check in BillService.payBill(). QE must test an explicit mismatch against any such variant endpoint."
+      },
+      {
+        "scenario": "Unexpected server error",
+        "http_status": 500,
+        "body": "{\"message\": \"Unable to retrieve payment history.\"}",
+        "notes": "The spec requires this exact message string. A global @ControllerAdvice exception handler must produce this shape. No such handler exists yet in the codebase — see qe_notes. Do not test 500 behavior until the handler is implemented."
+      }
+    ]
+  },
+
+  "qe_notes": [
+    {
+      "topic": "Audit logging infrastructure does not exist",
+      "severity": "high",
+      "detail": "Acceptance criteria 13 and 14 require every payment-history retrieval — successful and failed — to produce an audit log entry containing userId, eventType='PAYMENT_HISTORY_VIEW', timestamp, and outcome. There is currently no audit logging infrastructure in the codebase: no AuditLog entity, no audit repository, no audit service, and no AOP or @ControllerAdvice hook that writes such records. This is a net-new subsystem. QE cannot verify audit log behavior until it is built. Clarify with the PO whether audit logging ships in this sprint or a follow-up before writing test cases against it."
+    },
+    {
+      "topic": "Global exception handler does not exist",
+      "severity": "medium",
+      "detail": "The spec requires HTTP 500 with the exact body 'Unable to retrieve payment history.' for unexpected server errors. The codebase has no @ControllerAdvice or global exception handler — BillService throws raw RuntimeException and the caller receives Spring's default error shape. A PaymentController-specific or application-wide exception handler must be added to produce the required response body. QE should verify the exact message string once the handler is in place; the default Spring error body does not satisfy the acceptance criterion."
+    },
+    {
+      "topic": "Carol (ADMIN) and the policyholder payment history view",
+      "severity": "medium",
+      "detail": "The spec states users may view only their own payment history and lists 'Administrative payment-history management' as explicitly out of scope. The current SecurityConfig grants all authenticated roles access to all non-auth routes — there is no role-based guard on /api/payments/history. The product decision of whether ADMIN should reach this endpoint at all has not been made. QE should test the empty-state path (carol gets 200 with empty content array) and flag to the dev team whether a 403 role restriction is intended before this story is closed."
+    },
+    {
+      "topic": "Sidebar navigation placement for Payment History",
+      "severity": "low",
+      "detail": "The spec says Payment History is accessible from the Bills navigation section. In Sidebar.jsx the Bills entry currently links to /bills. The natural implementation is a new navItem immediately after Bills pointing to /payment-history, but it could also be a tab inside the Bills page. QE should confirm the approach with the dev team before writing navigation test cases, as the routes registered in App.jsx differ between approaches."
+    },
+    {
+      "topic": "DataInitializer: PaymentTransactionRepository injection pattern",
+      "severity": "low",
+      "detail": "DataInitializer.java uses Lombok @RequiredArgsConstructor with six private final repository fields. Adding PaymentTransactionRepository follows the exact same pattern — no constructor change needed. QE should verify on first app boot that the payment_transaction table is populated with seed rows before running any API tests. If the table is empty on boot, the DataInitializer change was not included in the build."
+    },
+    {
+      "topic": "PCI-DSS masking: verify at the database layer, not just the response layer",
+      "severity": "informational",
+      "detail": "Per PCI-DSS 3.3.1 and 3.4.1, the PaymentTransaction model must never store a full PAN. The paymentMethodReference column must contain only the masked value (e.g. '•••• 4242'). QE should verify via the H2 console at http://localhost:8080/h2-console (permitted by SecurityConfig) that payment_transaction rows contain only masked values — no 16-digit card numbers. This is a data-at-rest check and is separate from verifying the API response body."
+    },
+    {
+      "topic": "Receipt detail page is explicitly out of scope",
+      "severity": "informational",
+      "detail": "The mockups directory includes receipt-detail.png for design context only. The spec explicitly lists 'Receipt detail page' in explicitly_out_of_scope. Do not write test cases for receipt detail navigation, rendering, or any /api/payments/{id}/receipt endpoint in this cycle."
+    },
+    {
+      "topic": "CSV/PDF export, search, and filtering are explicitly out of scope",
+      "severity": "informational",
+      "detail": "Do not test or write cases for export, search, or filter functionality. All three are listed in the spec's explicitly_out_of_scope section."
+    }
+  ]
+}

@@ -10,13 +10,13 @@ description: >
   so the user can continue working while it runs.
 ---
 
-You are a senior developer on the First Lemons Insurance portal project. A SpecAgent (a PO-facing AI) has produced a feature spec in `new-feature-demo/new-feature-data.json`. The SpecAgent did rigorous requirements and compliance work but had no access to the real codebase — it invented plausible-sounding file paths and package names. Your job is to bridge that gap before QE picks the work up.
+You are a senior developer on the First Lemons Insurance portal project. A SpecAgent (a PO-facing AI) has produced a feature spec in `new-feature-demo/new-feature-data.json`. The SpecAgent did rigorous requirements and compliance work but had no access to the real codebase. Your job is to bridge that gap before QE picks the work up.
 
 ## Your task
 
 1. **Read the spec** at `new-feature-demo/new-feature-data.json` — understand the feature requirements, acceptance criteria, resolved decisions, compliance requirements, and mockups. The spec is PO-level only: it does not contain a data model, API spec, or file paths. You will derive all of those from the real codebase.
 
-2. **Explore the real codebase** — do not assume the spec paths are correct. Specifically:
+2. **Explore the real codebase** — Specifically:
    - List the backend controller, service, model, repository, and config directories to understand the real package and file structure.
    - Read `BillController.java` to understand the auth pattern (how JWT/Authentication is used, how userId is scoped, how the service is called).
    - Read `SecurityConfig.java` to understand how route authorization is currently configured.
