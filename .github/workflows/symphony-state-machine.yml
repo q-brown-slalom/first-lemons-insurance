@@ -1,0 +1,71 @@
+# .github/workflows/symphony-state-machine.yml
+name: Symphony State Machine
+
+on:
+  issues:
+    types: [labeled]
+  pull_request_review:
+    types: [submitted]
+
+env:
+  PROJECT_NUMBER: 3  # ← Change to your project number
+  ORG_OR_USER: "q-brown-slalom"  # ← Change to your org/username
+
+jobs:
+  update-board:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get project item ID
+        id: get-item
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+        run: |
+          # Get the project item ID for this issue
+          ITEM_ID=$(gh project item-list ${{ env.PROJECT_NUMBER }} \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --format json | jq -r '.items[] | select(.content.number == ${{ github.event.issue.number }}) | .id')
+          echo "item_id=$ITEM_ID" >> $GITHUB_OUTPUT
+
+      - name: Plan Approved → Implementing
+        if: github.event.label.name == 'plan-approved'
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+        run: |
+          gh project item-edit \
+            --project-id ${{ env.PROJECT_NUMBER }} \
+            --id ${{ steps.get-item.outputs.item_id }} \
+            --field-id STATUS_FIELD_ID \
+            --single-select-option-id IMPLEMENTING_OPTION_ID
+
+      - name: Plan Rejected → Rework
+        if: github.event.label.name == 'plan-rejected'
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+        run: |
+          gh project item-edit \
+            --project-id ${{ env.PROJECT_NUMBER }} \
+            --id ${{ steps.get-item.outputs.item_id }} \
+            --field-id STATUS_FIELD_ID \
+            --single-select-option-id REWORK_OPTION_ID
+
+      - name: Judgement Pass → Final Review
+        if: github.event.label.name == 'judgement-pass'
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+        run: |
+          gh project item-edit \
+            --project-id ${{ env.PROJECT_NUMBER }} \
+            --id ${{ steps.get-item.outputs.item_id }} \
+            --field-id STATUS_FIELD_ID \
+            --single-select-option-id FINAL_REVIEW_OPTION_ID
+
+      - name: Judgement Fail → Rework
+        if: github.event.label.name == 'judgement-fail'
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+        run: |
+          gh project item-edit \
+            --project-id ${{ env.PROJECT_NUMBER }} \
+            --id ${{ steps.get-item.outputs.item_id }} \
+            --field-id STATUS_FIELD_ID \
+            --single-select-option-id REWORK_OPTION_ID
