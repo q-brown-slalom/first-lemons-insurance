@@ -1,0 +1,607 @@
+# .github/workflows/symphony-dispatch.yml
+name: Symphony Agent Dispatch
+
+on:
+  # Primary trigger: label added to issue
+  issues:
+    types: [labeled]
+
+  # Secondary trigger: re-dispatch after human approves plan
+  # (plan-approved label moves to Implementing, which triggers Dev Agent)
+  # Also handles rework re-entry
+  
+  # Manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Issue number to process'
+        required: true
+        type: number
+      stage:
+        description: 'Which stage to run'
+        required: true
+        type: choice
+        options:
+          - planning
+          - implementing
+          - judgement
+
+env:
+  PROJECT_NUMBER: 1
+  ORG_OR_USER: "your-org"
+  REPO: ${{ github.repository }}
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────
+  # DISPATCHER: Determines which agent pipeline to run
+  # ─────────────────────────────────────────────────────────────────────
+  dispatch:
+    runs-on: ubuntu-latest
+    outputs:
+      stage: ${{ steps.determine-stage.outputs.stage }}
+      issue_number: ${{ steps.determine-stage.outputs.issue_number }}
+    steps:
+      - name: Determine stage from trigger
+        id: determine-stage
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "stage=${{ inputs.stage }}" >> $GITHUB_OUTPUT
+            echo "issue_number=${{ inputs.issue_number }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.label.name }}" == "ready-for-symphony" ]; then
+            echo "stage=planning" >> $GITHUB_OUTPUT
+            echo "issue_number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.label.name }}" == "plan-approved" ]; then
+            echo "stage=implementing" >> $GITHUB_OUTPUT
+            echo "issue_number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.label.name }}" == "rework-plan" ]; then
+            echo "stage=planning" >> $GITHUB_OUTPUT
+            echo "issue_number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.label.name }}" == "rework-implementation" ]; then
+            echo "stage=implementing" >> $GITHUB_OUTPUT
+            echo "issue_number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          else
+            echo "stage=none" >> $GITHUB_OUTPUT
+            echo "issue_number=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Skip if not a Symphony trigger
+        if: steps.determine-stage.outputs.stage == 'none'
+        run: echo "Not a Symphony trigger label. Skipping."
+
+  # ─────────────────────────────────────────────────────────────────────
+  # PLANNING: Product Agent → Design Agent → Post plan for human review
+  # ─────────────────────────────────────────────────────────────────────
+  planning:
+    needs: dispatch
+    if: needs.dispatch.outputs.stage == 'planning'
+    runs-on: ubuntu-latest
+    env:
+      ISSUE_NUMBER: ${{ needs.dispatch.outputs.issue_number }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Update project board → Planning
+        run: |
+          # Move issue to "Planning" status on the project board
+          ITEM_ID=$(gh project item-list ${{ env.PROJECT_NUMBER }} \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --format json | jq -r ".items[] | select(.content.number == ${{ env.ISSUE_NUMBER }}) | .id")
+          
+          gh project item-edit \
+            --project-id "${{ env.PROJECT_NUMBER }}" \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --id "$ITEM_ID" \
+            --field-id "${{ vars.STATUS_FIELD_ID }}" \
+            --single-select-option-id "${{ vars.PLANNING_OPTION_ID }}"
+
+      - name: Update Agent field → Product
+        run: |
+          ITEM_ID=$(gh project item-list ${{ env.PROJECT_NUMBER }} \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --format json | jq -r ".items[] | select(.content.number == ${{ env.ISSUE_NUMBER }}) | .id")
+          
+          gh project item-edit \
+            --project-id "${{ env.PROJECT_NUMBER }}" \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --id "$ITEM_ID" \
+            --field-id "${{ vars.AGENT_FIELD_ID }}" \
+            --single-select-option-id "${{ vars.AGENT_PRODUCT_OPTION_ID }}"
+
+      - name: Gather context
+        id: context
+        run: |
+          # Fetch issue details
+          ISSUE_BODY=$(gh issue view ${{ env.ISSUE_NUMBER }} --json body -q '.body')
+          ISSUE_TITLE=$(gh issue view ${{ env.ISSUE_NUMBER }} --json title -q '.title')
+          
+          # Fetch existing comments (for rework context)
+          COMMENTS=$(gh issue view ${{ env.ISSUE_NUMBER }} --json comments -q '.comments[].body' | tail -20)
+          
+          # Get repo structure for context
+          TREE=$(find app/ -type f -name "*.py" | head -50)
+          
+          # Save to files for agent consumption
+          echo "$ISSUE_TITLE" > /tmp/issue_title.txt
+          echo "$ISSUE_BODY" > /tmp/issue_body.txt
+          echo "$COMMENTS" > /tmp/issue_comments.txt
+          echo "$TREE" > /tmp/repo_structure.txt
+
+      - name: Run Product Agent
+        id: product-agent
+        run: |
+          python -m symphony.agents.product_agent \
+            --issue-number ${{ env.ISSUE_NUMBER }} \
+            --issue-title "$(cat /tmp/issue_title.txt)" \
+            --issue-body "$(cat /tmp/issue_body.txt)" \
+            --context "$(cat /tmp/issue_comments.txt)" \
+            --repo-structure "$(cat /tmp/repo_structure.txt)" \
+            --output /tmp/product_output.md
+
+      - name: Post Product Agent output
+        run: |
+          # Post refined requirements as issue comment
+          PRODUCT_OUTPUT=$(cat /tmp/product_output.md)
+          gh issue comment ${{ env.ISSUE_NUMBER }} --body "## 📋 Product Agent — Refined Requirements
+
+          $PRODUCT_OUTPUT
+
+          ---
+          *Agent: Product | Cycle: $(gh issue view ${{ env.ISSUE_NUMBER }} --json labels -q '.labels[].name' | grep -c 'rework' || echo 1)*"
+
+      - name: Update Agent field → Design
+        run: |
+          ITEM_ID=$(gh project item-list ${{ env.PROJECT_NUMBER }} \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --format json | jq -r ".items[] | select(.content.number == ${{ env.ISSUE_NUMBER }}) | .id")
+          
+          gh project item-edit \
+            --project-id "${{ env.PROJECT_NUMBER }}" \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --id "$ITEM_ID" \
+            --field-id "${{ vars.AGENT_FIELD_ID }}" \
+            --single-select-option-id "${{ vars.AGENT_DESIGN_OPTION_ID }}"
+
+      - name: Run Design Agent
+        id: design-agent
+        run: |
+          python -m symphony.agents.design_agent \
+            --issue-number ${{ env.ISSUE_NUMBER }} \
+            --product-spec /tmp/product_output.md \
+            --repo-structure "$(cat /tmp/repo_structure.txt)" \
+            --output /tmp/design_output.md
+
+      - name: Post Design Agent output
+        run: |
+          DESIGN_OUTPUT=$(cat /tmp/design_output.md)
+          gh issue comment ${{ env.ISSUE_NUMBER }} --body "## 🏗️ Design Agent — Technical Plan
+
+          $DESIGN_OUTPUT
+
+          ---
+          *Agent: Design | This plan requires human approval before implementation begins.*
+          
+          **👉 Reviewer:** Add the \`plan-approved\` label to proceed, or \`plan-rejected\` to send back for rework."
+
+      - name: Move to Plan Review
+        run: |
+          ITEM_ID=$(gh project item-list ${{ env.PROJECT_NUMBER }} \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --format json | jq -r ".items[] | select(.content.number == ${{ env.ISSUE_NUMBER }}) | .id")
+          
+          # Set status to Plan Review
+          gh project item-edit \
+            --project-id "${{ env.PROJECT_NUMBER }}" \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --id "$ITEM_ID" \
+            --field-id "${{ vars.STATUS_FIELD_ID }}" \
+            --single-select-option-id "${{ vars.PLAN_REVIEW_OPTION_ID }}"
+          
+          # Set agent to Human
+          gh project item-edit \
+            --project-id "${{ env.PROJECT_NUMBER }}" \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --id "$ITEM_ID" \
+            --field-id "${{ vars.AGENT_FIELD_ID }}" \
+            --single-select-option-id "${{ vars.AGENT_HUMAN_OPTION_ID }}"
+
+      - name: Add waiting label
+        run: |
+          gh issue edit ${{ env.ISSUE_NUMBER }} --add-label "awaiting-human-review"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # IMPLEMENTING: Dev Agent → Creates branch, writes code, opens PR
+  # ─────────────────────────────────────────────────────────────────────
+  implementing:
+    needs: dispatch
+    if: needs.dispatch.outputs.stage == 'implementing'
+    runs-on: ubuntu-latest
+    env:
+      ISSUE_NUMBER: ${{ needs.dispatch.outputs.issue_number }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Update project board → Implementing
+        run: |
+          ITEM_ID=$(gh project item-list ${{ env.PROJECT_NUMBER }} \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --format json | jq -r ".items[] | select(.content.number == ${{ env.ISSUE_NUMBER }}) | .id")
+          
+          gh project item-edit \
+            --project-id "${{ env.PROJECT_NUMBER }}" \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --id "$ITEM_ID" \
+            --field-id "${{ vars.STATUS_FIELD_ID }}" \
+            --single-select-option-id "${{ vars.IMPLEMENTING_OPTION_ID }}"
+          
+          gh project item-edit \
+            --project-id "${{ env.PROJECT_NUMBER }}" \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --id "$ITEM_ID" \
+            --field-id "${{ vars.AGENT_FIELD_ID }}" \
+            --single-select-option-id "${{ vars.AGENT_DEV_OPTION_ID }}"
+
+      - name: Remove review labels
+        run: |
+          gh issue edit ${{ env.ISSUE_NUMBER }} \
+            --remove-label "awaiting-human-review" \
+            --remove-label "plan-approved" 2>/dev/null || true
+
+      - name: Gather plan context
+        id: plan-context
+        run: |
+          # Get the design agent's plan from issue comments
+          COMMENTS=$(gh issue view ${{ env.ISSUE_NUMBER }} --json comments -q '.comments[].body')
+          ISSUE_TITLE=$(gh issue view ${{ env.ISSUE_NUMBER }} --json title -q '.title')
+          ISSUE_BODY=$(gh issue view ${{ env.ISSUE_NUMBER }} --json body -q '.body')
+          
+          # Extract the most recent Design Agent comment
+          DESIGN_PLAN=$(gh issue view ${{ env.ISSUE_NUMBER }} --json comments \
+            -q '.comments[] | select(.body | contains("Design Agent")) | .body' | tail -1)
+          
+          # Extract human review feedback (if any)
+          HUMAN_FEEDBACK=$(gh issue view ${{ env.ISSUE_NUMBER }} --json comments \
+            -q '.comments[] | select(.author.login != "github-actions[bot]") | .body' | tail -5)
+          
+          echo "$ISSUE_TITLE" > /tmp/issue_title.txt
+          echo "$ISSUE_BODY" > /tmp/issue_body.txt
+          echo "$DESIGN_PLAN" > /tmp/design_plan.txt
+          echo "$HUMAN_FEEDBACK" > /tmp/human_feedback.txt
+
+      - name: Create feature branch
+        id: branch
+        run: |
+          BRANCH_NAME="feature/${{ env.ISSUE_NUMBER }}-$(cat /tmp/issue_title.txt | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-' | head -c 40)"
+          git checkout -b "$BRANCH_NAME"
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+
+      - name: Run Dev Agent
+        id: dev-agent
+        run: |
+          python -m symphony.agents.dev_agent \
+            --issue-number ${{ env.ISSUE_NUMBER }} \
+            --issue-title "$(cat /tmp/issue_title.txt)" \
+            --issue-body "$(cat /tmp/issue_body.txt)" \
+            --design-plan /tmp/design_plan.txt \
+            --human-feedback /tmp/human_feedback.txt \
+            --repo-root "$(pwd)" \
+            --output-manifest /tmp/changes_manifest.json
+
+          # The dev agent writes files directly to the working tree
+          # changes_manifest.json lists what was created/modified
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "symphony-bot"
+          git config user.email "symphony-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(#${{ env.ISSUE_NUMBER }}): $(cat /tmp/issue_title.txt)
+
+          Implemented by Symphony Dev Agent.
+          See issue #${{ env.ISSUE_NUMBER }} for plan and context."
+          git push origin "${{ steps.branch.outputs.branch_name }}"
+
+      - name: Open Pull Request
+        id: create-pr
+        run: |
+          CHANGES_SUMMARY=$(cat /tmp/changes_manifest.json | python -c "
+          import json, sys
+          manifest = json.load(sys.stdin)
+          for f in manifest.get('files', []):
+              print(f\"- \`{f['path']}\` — {f['action']}: {f['description']}\")
+          ")
+          
+          PR_URL=$(gh pr create \
+            --base main \
+            --head "${{ steps.branch.outputs.branch_name }}" \
+            --title "feat(#${{ env.ISSUE_NUMBER }}): $(cat /tmp/issue_title.txt)" \
+            --body "## Summary
+          
+          Closes #${{ env.ISSUE_NUMBER }}
+          
+          ## Changes
+          
+          $CHANGES_SUMMARY
+          
+          ## Context
+          
+          - **Plan:** See [Design Agent comment](https://github.com/${{ env.REPO }}/issues/${{ env.ISSUE_NUMBER }})
+          - **Agent:** Dev Agent (Symphony)
+          - **Cycle:** $(gh issue view ${{ env.ISSUE_NUMBER }} --json labels -q '[.labels[].name] | map(select(startswith("cycle"))) | .[0] // "1"')
+          
+          ---
+          *This PR was generated by Symphony Dev Agent. Judgement Agent will evaluate automatically.*")
+          
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+
+      - name: Update PR Link on project
+        run: |
+          ITEM_ID=$(gh project item-list ${{ env.PROJECT_NUMBER }} \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --format json | jq -r ".items[] | select(.content.number == ${{ env.ISSUE_NUMBER }}) | .id")
+          
+          gh project item-edit \
+            --project-id "${{ env.PROJECT_NUMBER }}" \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --id "$ITEM_ID" \
+            --field-id "${{ vars.PR_LINK_FIELD_ID }}" \
+            --text "${{ steps.create-pr.outputs.pr_url }}"
+
+      - name: Trigger Judgement
+        run: |
+          # The judgement workflow is triggered by PR open event (see judgement-engine.yml)
+          # But we also move the board status
+          ITEM_ID=$(gh project item-list ${{ env.PROJECT_NUMBER }} \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --format json | jq -r ".items[] | select(.content.number == ${{ env.ISSUE_NUMBER }}) | .id")
+          
+          gh project item-edit \
+            --project-id "${{ env.PROJECT_NUMBER }}" \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --id "$ITEM_ID" \
+            --field-id "${{ vars.STATUS_FIELD_ID }}" \
+            --single-select-option-id "${{ vars.JUDGEMENT_OPTION_ID }}"
+          
+          gh project item-edit \
+            --project-id "${{ env.PROJECT_NUMBER }}" \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --id "$ITEM_ID" \
+            --field-id "${{ vars.AGENT_FIELD_ID }}" \
+            --single-select-option-id "${{ vars.AGENT_TESTING_OPTION_ID }}"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # JUDGEMENT: Testing Agent → Evaluates PR against gates
+  # ─────────────────────────────────────────────────────────────────────
+  judgement:
+    needs: dispatch
+    if: needs.dispatch.outputs.stage == 'judgement'
+    runs-on: ubuntu-latest
+    env:
+      ISSUE_NUMBER: ${{ needs.dispatch.outputs.issue_number }}
+    steps:
+      - name: Checkout repository (PR branch)
+        uses: actions/checkout@v4
+        with:
+          # Checkout the PR branch to run tests against it
+          ref: ${{ github.event.pull_request.head.ref || '' }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run test suite
+        id: tests
+        continue-on-error: true
+        run: |
+          # Run the actual project tests
+          pytest tests/ --tb=short --json-report --json-report-file=/tmp/test_results.json 2>&1 | tee /tmp/test_output.txt
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Run linter / code quality
+        id: lint
+        continue-on-error: true
+        run: |
+          ruff check . --output-format json > /tmp/lint_results.json 2>&1
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Gather PR context for Testing Agent
+        run: |
+          # Get the PR diff
+          PR_NUMBER=$(gh pr list --head "$(git branch --show-current)" --json number -q '.[0].number')
+          gh pr diff "$PR_NUMBER" > /tmp/pr_diff.txt
+          
+          # Get issue acceptance criteria
+          gh issue view ${{ env.ISSUE_NUMBER }} --json body -q '.body' > /tmp/acceptance_criteria.txt
+          
+          # Get the design plan
+          gh issue view ${{ env.ISSUE_NUMBER }} --json comments \
+            -q '.comments[] | select(.body | contains("Design Agent")) | .body' | tail -1 > /tmp/design_plan.txt
+
+      - name: Run Testing Agent (Judgement Engine)
+        id: testing-agent
+        run: |
+          python -m symphony.agents.testing_agent \
+            --issue-number ${{ env.ISSUE_NUMBER }} \
+            --pr-diff /tmp/pr_diff.txt \
+            --test-results /tmp/test_results.json \
+            --test-output /tmp/test_output.txt \
+            --lint-results /tmp/lint_results.json \
+            --acceptance-criteria /tmp/acceptance_criteria.txt \
+            --design-plan /tmp/design_plan.txt \
+            --test-exit-code ${{ steps.tests.outputs.exit_code }} \
+            --lint-exit-code ${{ steps.lint.outputs.exit_code }} \
+            --output /tmp/judgement_report.md \
+            --output-json /tmp/judgement_result.json
+
+          # judgement_result.json contains:
+          # { "gate1": "pass"|"fail", "gate2": "pass"|"fail", 
+          #   "gate3": "pass"|"gap", "gate4": "pass"|"gap",
+          #   "overall": "pass"|"fail", "reason": "..." }
+
+      - name: Parse judgement result
+        id: result
+        run: |
+          OVERALL=$(jq -r '.overall' /tmp/judgement_result.json)
+          GATE1=$(jq -r '.gate1' /tmp/judgement_result.json)
+          GATE2=$(jq -r '.gate2' /tmp/judgement_result.json)
+          GATE3=$(jq -r '.gate3' /tmp/judgement_result.json)
+          GATE4=$(jq -r '.gate4' /tmp/judgement_result.json)
+          
+          echo "overall=$OVERALL" >> $GITHUB_OUTPUT
+          echo "gate1=$GATE1" >> $GITHUB_OUTPUT
+          echo "gate2=$GATE2" >> $GITHUB_OUTPUT
+          echo "gate3=$GATE3" >> $GITHUB_OUTPUT
+          echo "gate4=$GATE4" >> $GITHUB_OUTPUT
+
+      - name: Post Judgement Report to PR
+        run: |
+          PR_NUMBER=$(gh pr list --head "$(git branch --show-current)" --json number -q '.[0].number')
+          REPORT=$(cat /tmp/judgement_report.md)
+          
+          gh pr comment "$PR_NUMBER" --body "## ⚖️ Judgement Report (Testing Agent)
+
+          $REPORT
+
+          ---
+          *Agent: Testing | Overall: ${{ steps.result.outputs.overall }}*"
+
+      - name: Post Judgement Report to Issue
+        run: |
+          REPORT=$(cat /tmp/judgement_report.md)
+          gh issue comment ${{ env.ISSUE_NUMBER }} --body "## ⚖️ Judgement Complete
+
+          $REPORT
+          
+          ---
+          **Overall: ${{ steps.result.outputs.overall }}**"
+
+      - name: Update gate fields on project board
+        run: |
+          ITEM_ID=$(gh project item-list ${{ env.PROJECT_NUMBER }} \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --format json | jq -r ".items[] | select(.content.number == ${{ env.ISSUE_NUMBER }}) | .id")
+          
+          # Update Gate 1
+          gh project item-edit \
+            --project-id "${{ env.PROJECT_NUMBER }}" \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --id "$ITEM_ID" \
+            --field-id "${{ vars.GATE1_FIELD_ID }}" \
+            --single-select-option-id "${{ steps.result.outputs.gate1 == 'pass' && vars.GATE_PASS_OPTION_ID || vars.GATE_FAIL_OPTION_ID }}"
+          
+          # Update Gate 2
+          gh project item-edit \
+            --project-id "${{ env.PROJECT_NUMBER }}" \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --id "$ITEM_ID" \
+            --field-id "${{ vars.GATE2_FIELD_ID }}" \
+            --single-select-option-id "${{ steps.result.outputs.gate2 == 'pass' && vars.GATE_PASS_OPTION_ID || vars.GATE_FAIL_OPTION_ID }}"
+
+          # Update Gate 3
+          gh project item-edit \
+            --project-id "${{ env.PROJECT_NUMBER }}" \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --id "$ITEM_ID" \
+            --field-id "${{ vars.GATE3_FIELD_ID }}" \
+            --single-select-option-id "${{ steps.result.outputs.gate3 == 'pass' && vars.GATE3_PASS_OPTION_ID || vars.GATE3_GAP_OPTION_ID }}"
+
+          # Update Gate 4
+          gh project item-edit \
+            --project-id "${{ env.PROJECT_NUMBER }}" \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --id "$ITEM_ID" \
+            --field-id "${{ vars.GATE4_FIELD_ID }}" \
+            --single-select-option-id "${{ steps.result.outputs.gate4 == 'pass' && vars.GATE4_PASS_OPTION_ID || vars.GATE4_GAP_OPTION_ID }}"
+
+      - name: Apply result labels
+        run: |
+          # Add gate labels
+          gh issue edit ${{ env.ISSUE_NUMBER }} \
+            --add-label "gate1-${{ steps.result.outputs.gate1 }}" \
+            --add-label "gate2-${{ steps.result.outputs.gate2 }}"
+          
+          if [ "${{ steps.result.outputs.gate3 }}" == "gap" ]; then
+            gh issue edit ${{ env.ISSUE_NUMBER }} --add-label "gate3-gap"
+          fi
+          if [ "${{ steps.result.outputs.gate4 }}" == "gap" ]; then
+            gh issue edit ${{ env.ISSUE_NUMBER }} --add-label "gate4-gap"
+          fi
+
+      - name: Route based on result
+        run: |
+          ITEM_ID=$(gh project item-list ${{ env.PROJECT_NUMBER }} \
+            --owner "${{ env.ORG_OR_USER }}" \
+            --format json | jq -r ".items[] | select(.content.number == ${{ env.ISSUE_NUMBER }}) | .id")
+          
+          if [ "${{ steps.result.outputs.overall }}" == "pass" ]; then
+            # PASS → Move to Final Review (Human Gate B)
+            gh issue edit ${{ env.ISSUE_NUMBER }} \
+              --add-label "judgement-pass" \
+              --add-label "awaiting-human-review"
+            
+            gh project item-edit \
+              --project-id "${{ env.PROJECT_NUMBER }}" \
+              --owner "${{ env.ORG_OR_USER }}" \
+              --id "$ITEM_ID" \
+              --field-id "${{ vars.STATUS_FIELD_ID }}" \
+              --single-select-option-id "${{ vars.FINAL_REVIEW_OPTION_ID }}"
+            
+            gh project item-edit \
+              --project-id "${{ env.PROJECT_NUMBER }}" \
+              --owner "${{ env.ORG_OR_USER }}" \
+              --id "$ITEM_ID" \
+              --field-id "${{ vars.AGENT_FIELD_ID }}" \
+              --single-select-option-id "${{ vars.AGENT_HUMAN_OPTION_ID }}"
+          
+          else
+            # FAIL → Move to Rework
+            gh issue edit ${{ env.ISSUE_NUMBER }} \
+              --add-label "judgement-fail" \
+              --add-label "rework-implementation" \
+              --add-label "has-rework"
+            
+            gh project item-edit \
+              --project-id "${{ env.PROJECT_NUMBER }}" \
+              --owner "${{ env.ORG_OR_USER }}" \
+              --id "$ITEM_ID" \
+              --field-id "${{ vars.STATUS_FIELD_ID }}" \
+              --single-select-option-id "${{ vars.REWORK_OPTION_ID }}"
+            
+            # Increment cycle count
+            CURRENT_CYCLE=$(gh project item-list ${{ env.PROJECT_NUMBER }} \
+              --owner "${{ env.ORG_OR_USER }}" \
+              --format json | jq -r ".items[] | select(.content.number == ${{ env.ISSUE_NUMBER }}) | .cycle // 1")
+            NEW_CYCLE=$((CURRENT_CYCLE + 1))
+            
+            gh project item-edit \
+              --project-id "${{ env.PROJECT_NUMBER }}" \
+              --owner "${{ env.ORG_OR_USER }}" \
+              --id "$ITEM_ID" \
+              --field-id "${{ vars.CYCLE_FIELD_ID }}" \
+              --number "$NEW_CYCLE"
+          fi
